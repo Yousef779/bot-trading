@@ -1,0 +1,766 @@
+import os
+import math
+import socket
+import time
+import threading
+from time import sleep
+from datetime import datetime
+from functools import wraps
+import logging
+from logging.handlers import RotatingFileHandler
+
+import pandas as pd
+import numpy as np
+import ta
+import ccxt
+import matplotlib.pyplot as plt  # لرسم الشارت
+
+from keys import api, secret
+
+# إعداد ملف السجلات والتسجيل
+LOG_DIR = "logs"
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+logger = logging.getLogger("TradingBot")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+file_handler = RotatingFileHandler(os.path.join(LOG_DIR, "bot.log"), maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+def log_info(message: str) -> None:
+    logger.info(message)
+
+def log_error(message: str) -> None:
+    logger.error(message)
+
+# إعداد عميل ccxt لـ Binance Futures مع زيادة فترة المهلة (timeout)
+exchange = ccxt.binance({
+    'apiKey': api,
+    'secret': secret,
+    'enableRateLimit': True,
+    'timeout': 30000,  # 30 ثانية
+    'options': {
+        'defaultType': 'future'
+    }
+})
+
+def load_markets_with_retry(exchange, retries=3, delay=5):
+    for attempt in range(retries):
+        try:
+            exchange.load_markets()
+            log_info("🌐 تم تحميل الأسواق بنجاح")
+            return
+        except ccxt.RequestTimeout as e:
+            log_error(f"⛔ انتهاء المهلة أثناء تحميل الأسواق، المحاولة {attempt + 1}/{retries}: {str(e)}")
+            sleep(delay)
+    raise Exception("⛔ فشل تحميل الأسواق بعد عدة محاولات.")
+
+load_markets_with_retry(exchange)
+
+STRATEGY_PARAMS = {
+    'tp': 0.012,
+    'sl': 0.009,
+    'volume': 8,
+    'leverage': 20,
+    'margin_type': 'ISOLATED',
+    'max_positions': 100,
+    'threshold': 0.2,  # القيمة الأساسية للعتبة
+    'signal_weights': {
+        'rsi': 0.10,
+        'macd': 0.22,
+        'ema': 0.12,
+        'ma_cross': 0.18,
+        'sr': 0.10,
+        'fib': 0.08,
+        'volume': 0.07,
+        'bollinger': 0.15,
+        'stoch': 0.10,
+        'momentum': 0.10,
+        'candlestick': 0.10,
+        'ichimoku': 0.10,
+        'adx': 0.10
+    }
+}
+
+# ---------------------- إدارة API ----------------------
+def rate_limiter(max_calls_per_sec: float = 10.0):
+    interval = 1 / max_calls_per_sec
+    last_call = [0.0]
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            elapsed = time.time() - last_call[0]
+            if elapsed < interval:
+                sleep(interval - elapsed)
+            result = func(*args, **kwargs)
+            last_call[0] = time.time()
+            return result
+        return wrapper
+    return decorator
+
+def circuit_breaker(max_failures: int = 5, reset_time: int = 60):
+    failures = 0
+    last_failure_time = None
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            nonlocal failures, last_failure_time
+            if failures >= max_failures:
+                if last_failure_time and (time.time() - last_failure_time) < reset_time:
+                    log_error("🔒 الدائرة الأمنية نشطة: تأخير الاستدعاءات")
+                    sleep(reset_time)
+                    failures = 0
+                else:
+                    failures = 0
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                failures += 1
+                last_failure_time = time.time()
+                log_error(f"⛔ خطأ أثناء تنفيذ {func.__name__}: {str(e)}. المحاولة {failures}/{max_failures}")
+                sleep(2)
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# ---------------------- نموذج مخاطر ديناميكي ----------------------
+class RiskManager:
+    def __init__(self, daily_loss_limit: float = 0.05):
+        self.daily_loss_limit = daily_loss_limit
+        self.daily_loss = 0.0
+        self.start_day = datetime.now().date()
+        self.lock = threading.Lock()
+    def update_loss(self, loss_amount: float) -> None:
+        with self.lock:
+            self.daily_loss += loss_amount
+            log_info(f"💸 تحديث الخسائر اليومية: {self.daily_loss:.4f}")
+            if self.daily_loss >= self.daily_loss_limit:
+                log_error("🚨 تجاوز الحد اليومي للخسائر! إيقاف التداول تلقائيًا.")
+                os._exit(1)
+    def reset_daily_loss(self) -> None:
+        with self.lock:
+            today = datetime.now().date()
+            if today != self.start_day:
+                self.daily_loss = 0.0
+                self.start_day = today
+                log_info("🔄 إعادة تعيين الخسائر اليومية.")
+
+# ---------------------- دمج التعلم الآلي ----------------------
+class MLModel:
+    def __init__(self, model_path: str = None):
+        self.model = None  # يمكن تحميل نموذج مُدرب مسبقاً من ملف إن وُجد
+        log_info("🤖 تم تهيئة نموذج التعلم الآلي.")
+
+    def predict_adjustment(self, features: dict) -> float:
+        """
+        استخدام مجموعة ميزات أكثر لتحسين تعديل العتبة.
+        المعادلة المبدئية تجمع بين:
+          - التقلب (volatility)
+          - متوسط الحجم (avg_volume)
+          - تغير قيمة RSI (rsi_change)
+        ويمكن تعديل المعادلة لاحقاً أو استبدالها بنموذج مُدرب.
+        """
+        volatility = features.get("volatility", 0)
+        avg_volume = features.get("avg_volume", 1)
+        rsi_change = features.get("rsi_change", 0)
+        # معادلة مبسطة لتعديل العتبة:
+        adjustment = 0.05 * volatility + 0.000001 * avg_volume + 0.02 * abs(rsi_change)
+        log_info(f"🤖 معامل التعديل المحسوب: {adjustment:.4f} باستخدام الميزات: {features}")
+        return adjustment
+
+    def adjust_signal_weights(self, base_weights: dict, features: dict) -> dict:
+        # استخدام معامل التعديل لتعديل أوزان المؤشرات
+        adjustment = self.predict_adjustment(features)
+        adjusted_weights = {indicator: weight * (1 + adjustment) for indicator, weight in base_weights.items()}
+        log_info(f"🤖 أوزان المؤشرات المعدلة: {adjusted_weights}")
+        return adjusted_weights
+
+    def adjust_threshold(self, base_threshold: float, features: dict) -> float:
+        """
+        تعديل العتبة بناءً على مجموعة من الميزات.
+        يتم زيادة العتبة مع ارتفاع التقلب أو تغير المؤشرات لتفادي إشارات خاطئة.
+        """
+        adjustment = self.predict_adjustment(features)
+        adjusted_threshold = base_threshold * (1 + adjustment)
+        log_info(f"🤖 عتبة التنفيذ المعدلة: {adjusted_threshold:.4f}")
+        return adjusted_threshold
+
+# ---------------------- تحسينات الأداء والتخزين المؤقت ----------------------
+class MarketDataCache:
+    def __init__(self, expiry_seconds: int = 60):
+        self.cache = {}
+        self.expiry = expiry_seconds
+        self.lock = threading.Lock()
+    def get(self, key: str):
+        with self.lock:
+            data, timestamp = self.cache.get(key, (None, None))
+            if data and (time.time() - timestamp) < self.expiry:
+                return data
+            return None
+    def set(self, key: str, data) -> None:
+        with self.lock:
+            self.cache[key] = (data, time.time())
+
+# ---------------------- وحدة مراقبة ----------------------
+class Monitor(threading.Thread):
+    def __init__(self, bot, interval: int = 60):
+        super().__init__(daemon=True)
+        self.bot = bot
+        self.interval = interval
+    def run(self):
+        while True:
+            log_info("📊 مراقبة النظام: تتبع الأداء والصحة")
+            sleep(self.interval)
+
+# ---------------------- وحدة Backtesting ----------------------
+class Backtester:
+    def __init__(self, data: pd.DataFrame, bot: 'AdvancedTradingBot'):
+        self.data = data
+        self.bot = bot
+        self.trades = []
+    def run_backtest(self):
+        for i in range(200, len(self.data)):
+            df_slice = self.data.iloc[i-200:i].copy()
+            signal = self.bot.generate_signal_from_df(df_slice)
+            if signal in ['up', 'down']:
+                price = df_slice['Close'].iloc[-1]
+                qty = self.bot.calculate_position_size_dynamic(price, "TEST/USDT")
+                self.trades.append({
+                    'time': df_slice.index[-1],
+                    'signal': signal,
+                    'price': price,
+                    'qty': qty
+                })
+        return self.trades
+    def performance_report(self):
+        wins = sum(1 for trade in self.trades if trade['signal'] == 'up')
+        losses = sum(1 for trade in self.trades if trade['signal'] == 'down')
+        log_info(f"تقرير الباكتيستينج: صفقات رابحة: {wins} - صفقات خاسرة: {losses}")
+
+# ---------------------- وحدة Chart Analyzer ----------------------
+class ChartAnalyzer:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+    def plot_chart(self):
+        plt.figure(figsize=(12,6))
+        plt.plot(self.df.index, self.df['Close'], label='Close Price')
+        if 'MA50' in self.df.columns:
+            plt.plot(self.df.index, self.df['MA50'], label='MA50')
+        if 'EMA20' in self.df.columns:
+            plt.plot(self.df.index, self.df['EMA20'], label='EMA20')
+        plt.title("الرسم البياني مع المؤشرات")
+        plt.xlabel("الوقت")
+        plt.ylabel("السعر")
+        plt.legend()
+        plt.show()
+
+# ---------------------- الكلاس الأساسي AdvancedTradingBot ----------------------
+class AdvancedTradingBot:
+    def __init__(self):
+        self.signals_cache = {}
+        self.risk_manager = RiskManager(daily_loss_limit=0.05)
+        self.ml_model = MLModel()
+        self.data_cache = MarketDataCache(expiry_seconds=60)
+        log_info("✅ تم تهيئة البوت بنجاح باستخدام ccxt")
+    def check_api_connectivity(self) -> bool:
+        try:
+            socket.create_connection(("fapi.binance.com", 443), 5)
+            log_info("🌐 اتصال API نشط")
+            return True
+        except socket.error as e:
+            log_error(f"⛔ فشل الاتصال بالخوادم: {str(e)}")
+            log_info("• تأكد من اتصالك بالإنترنت")
+            log_info("• جرب استخدام VPN إذا كنت على شبكة مقيدة")
+            return False
+    @rate_limiter(max_calls_per_sec=10)
+    @circuit_breaker(max_failures=5, reset_time=60)
+    def get_balance_usdt(self) -> float:
+        try:
+            balance = exchange.fetch_balance()
+            usdt = balance.get('free', {}).get('USDT', 0.0)
+            log_info(f"💰 الرصيد المتاح: {usdt:.2f} USDT")
+            return float(usdt)
+        except Exception as error:
+            self.handle_api_error(error)
+            return 0.0
+    @rate_limiter(max_calls_per_sec=10)
+    @circuit_breaker(max_failures=5, reset_time=60)
+    def get_tickers_usdt(self) -> list:
+        try:
+            symbols = [s for s in exchange.symbols if 'USDT' in s and s in exchange.markets]
+            log_info(f"📊 عدد الرموز المتاحة بعد التصفية: {len(symbols)}")
+            return symbols
+        except Exception as error:
+            self.handle_api_error(error)
+            return []
+    def get_klines(self, symbol: str, interval: str = '15m') -> pd.DataFrame:
+        try:
+            if symbol not in exchange.markets:
+                log_error(f"⛔ السوق {symbol} غير متوفر في Binance Futures")
+                return pd.DataFrame()
+            cache_key = f"{symbol}_{interval}"
+            cached = self.data_cache.get(cache_key)
+            if cached is not None:
+                return cached.copy()
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=interval, limit=200)
+            resp = pd.DataFrame(ohlcv, columns=['Time', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            expected_columns = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
+            if not all(col in resp.columns for col in expected_columns):
+                log_error(f"⛔ بنية البيانات غير متوافقة. الأعمدة الموجودة: {resp.columns.tolist()}")
+                return pd.DataFrame()
+            resp['Time'] = pd.to_datetime(resp['Time'], unit='ms')
+            resp = resp.set_index('Time')
+            resp = resp.astype(float).dropna()
+            if resp.empty or len(resp) < 20:
+                log_error(f"⛔ بيانات غير كافية أو مفقودة للرمز {symbol} على الإطار {interval}")
+                return pd.DataFrame()
+            log_info(f"📊 أعمدة البيانات لـ {symbol} على {interval}: {resp.columns.tolist()}")
+            df = self.calculate_indicators(resp)
+            self.data_cache.set(cache_key, df)
+            return df
+        except Exception as e:
+            log_error(f"⛔ فشل جلب البيانات للرمز {symbol}: {str(e)}")
+            return pd.DataFrame()
+    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        try:
+            df['MA50'] = ta.trend.sma_indicator(df['Close'], 50)
+            df['MA200'] = ta.trend.sma_indicator(df['Close'], 200)
+            df['EMA20'] = ta.trend.ema_indicator(df['Close'], 20)
+            df['EMA50'] = ta.trend.ema_indicator(df['Close'], 50)
+            df['RSI'] = ta.momentum.rsi(df['Close'], 14)
+            df['BB_upper'] = ta.volatility.bollinger_hband(df['Close'])
+            df['BB_lower'] = ta.volatility.bollinger_lband(df['Close'])
+            df['RESISTANCE'] = df['High'].rolling(50).max()
+            df['SUPPORT'] = df['Low'].rolling(50).min()
+            df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
+            volume_mean = df['Volume'].rolling(20).mean().replace(0, np.nan)
+            df['Volume_Spike'] = (df['Volume'] / volume_mean).fillna(0)
+            df['Swing_High'] = df['High'].rolling(20).max()
+            df['Swing_Low'] = df['Low'].rolling(20).min()
+            diff = df['Swing_High'] - df['Swing_Low']
+            df['Fib_23.6'] = df['Swing_High'] - diff * 0.236
+            df['STOCH'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'])
+            df['Momentum'] = ta.momentum.roc(df['Close'], 10)
+            df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+            return df
+        except Exception as e:
+            log_error(f"⛔ خطأ في حساب المؤشرات: {str(e)}")
+            return df
+    def dynamic_rsi_thresholds(self, df: pd.DataFrame) -> tuple:
+        volatility = df['Close'].rolling(14).std().iloc[-1]
+        if volatility > df['Close'].mean() * 0.02:
+            return 35, 65
+        return 40, 60
+    def rsi_signal(self, df: pd.DataFrame) -> int:
+        try:
+            current_rsi = df['RSI'].iloc[-1]
+            low_threshold, high_threshold = self.dynamic_rsi_thresholds(df)
+            volume_spike = df['Volume_Spike'].iloc[-1]
+            if current_rsi < low_threshold and volume_spike > 1.2:
+                return 1
+            elif current_rsi > high_threshold and volume_spike > 1.2:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ عمود RSI غير موجود")
+            return 0
+    def macd_signal(self, df: pd.DataFrame) -> int:
+        try:
+            macd = ta.trend.MACD(df['Close'])
+            if macd.macd_diff().iloc[-1] > 0 and df['Close'].iloc[-1] > df['MA200'].iloc[-1]:
+                return 1
+            elif macd.macd_diff().iloc[-1] < 0 and df['Close'].iloc[-1] < df['MA200'].iloc[-1]:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات MACD غير مكتملة")
+            return 0
+    def ema_signal(self, df: pd.DataFrame) -> int:
+        try:
+            if df['EMA20'].iloc[-1] > df['EMA50'].iloc[-1] and df['EMA20'].iloc[-2] <= df['EMA50'].iloc[-2]:
+                return 1
+            elif df['EMA20'].iloc[-1] < df['EMA50'].iloc[-1] and df['EMA20'].iloc[-2] >= df['EMA50'].iloc[-2]:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات EMA غير صالحة")
+            return 0
+    def ma_cross_signal(self, df: pd.DataFrame) -> int:
+        try:
+            if df['MA50'].iloc[-1] > df['MA200'].iloc[-1] and df['MA50'].iloc[-2] <= df['MA200'].iloc[-2]:
+                return 1
+            elif df['MA50'].iloc[-1] < df['MA200'].iloc[-1] and df['MA50'].iloc[-2] >= df['MA200'].iloc[-2]:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات المتوسطات المتحركة غير مكتملة")
+            return 0
+    def support_resistance_signal(self, df: pd.DataFrame) -> int:
+        try:
+            if df['Close'].iloc[-1] > df['RESISTANCE'].iloc[-1] and df['Volume'].iloc[-1] > df['Volume'].mean():
+                return 1
+            elif df['Close'].iloc[-1] < df['SUPPORT'].iloc[-1] and df['Volume'].iloc[-1] > df['Volume'].mean():
+                return -1
+            return 0
+        except KeyError as e:
+            log_error(f"⛔ خطأ في الأعمدة: {str(e)}")
+            return 0
+    def fibonacci_signal(self, df: pd.DataFrame) -> int:
+        try:
+            if df['Close'].iloc[-1] <= df['Fib_23.6'].iloc[-1] and df['RSI'].iloc[-1] < 40:
+                return 1
+            elif df['Close'].iloc[-1] >= df['Swing_High'].iloc[-1] and df['RSI'].iloc[-1] > 60:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات فيبوناتشي غير مكتملة")
+            return 0
+    def volume_signal(self, df: pd.DataFrame) -> int:
+        try:
+            if df['Volume_Spike'].iloc[-1] > 2.0 and df['Close'].iloc[-1] > df['VWAP'].iloc[-1]:
+                return 1
+            elif df['Volume_Spike'].iloc[-1] > 2.0 and df['Close'].iloc[-1] < df['VWAP'].iloc[-1]:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات الحجم غير صالحة")
+            return 0
+    def bollinger_signal(self, df: pd.DataFrame) -> int:
+        try:
+            price = df['Close'].iloc[-1]
+            if price < df['BB_lower'].iloc[-1]:
+                return 1
+            elif price > df['BB_upper'].iloc[-1]:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات بولينجر باندز غير مكتملة")
+            return 0
+    def stoch_signal(self, df: pd.DataFrame) -> int:
+        try:
+            stoch = df['STOCH'].iloc[-1]
+            if stoch < 20:
+                return 1
+            elif stoch > 80:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات الاستوكاستيك غير موجودة")
+            return 0
+    def momentum_signal(self, df: pd.DataFrame) -> int:
+        try:
+            momentum = df['Momentum'].iloc[-1]
+            if momentum > 0:
+                return 1
+            elif momentum < 0:
+                return -1
+            return 0
+        except KeyError:
+            log_error("⛔ بيانات المومنتوم غير موجودة")
+            return 0
+    def candlestick_signal(self, df: pd.DataFrame) -> int:
+        try:
+            if len(df) < 2:
+                return 0
+            signal = 0
+            prev = df.iloc[-2]
+            curr = df.iloc[-1]
+            open_price = curr['Open']
+            close_price = curr['Close']
+            high_price = curr['High']
+            low_price = curr['Low']
+            body = abs(close_price - open_price)
+            range_total = high_price - low_price if (high_price - low_price) != 0 else 1
+            upper_shadow = high_price - max(open_price, close_price)
+            lower_shadow = min(open_price, close_price) - low_price
+
+            # نموذج الابتلاع (Engulfing)
+            if prev['Close'] < prev['Open'] and close_price > open_price and open_price < prev['Close'] and close_price > prev['Open']:
+                log_info("📈 اكتشاف ابتلاع شرائي")
+                signal += 1
+            elif prev['Close'] > prev['Open'] and close_price < open_price and open_price > prev['Close'] and close_price < prev['Open']:
+                log_info("📉 اكتشاف ابتلاع بيعي")
+                signal -= 1
+
+            # نمط المطرقة (Hammer) bullish
+            if body < (0.3 * range_total) and lower_shadow >= 2 * body and upper_shadow < body:
+                log_info("📈 اكتشاف نمط المطرقة الصاعدة")
+                signal += 1
+
+            # نمط النجم الساقط (Shooting Star) bearish
+            if body < (0.3 * range_total) and upper_shadow >= 2 * body and lower_shadow < body:
+                log_info("📉 اكتشاف نمط النجم الساقط الهابطة")
+                signal -= 1
+
+            # نمط الدوجي (Doji)
+            if abs(open_price - close_price) < (0.1 * range_total):
+                log_info("⚖️ اكتشاف نمط الدوجي (عدم اليقين)")
+                # عدم تعديل الإشارة
+
+            # نمط الابتلاع الكبير (Large Engulfing)
+            if (prev['Close'] - prev['Open']) * (close_price - open_price) < 0:
+                if abs(close_price - open_price) > 1.5 * abs(prev['Close'] - prev['Open']):
+                    if close_price > open_price:
+                        log_info("📈 اكتشاف نمط ابتلاع كبير شرائي")
+                        signal += 1
+                    else:
+                        log_info("📉 اكتشاف نمط ابتلاع كبير بيعي")
+                        signal -= 1
+
+            return int(round(signal))
+        except Exception as e:
+            log_error(f"⛔ خطأ في تحليل أنماط الشموع اليابانية: {str(e)}")
+            return 0
+    def ichimoku_signal(self, df: pd.DataFrame) -> int:
+        try:
+            ichimoku = ta.trend.IchimokuIndicator(high=df['High'], low=df['Low'], window1=9, window2=26, window3=52)
+            tenkan = ichimoku.ichimoku_conversion_line()
+            kijun = ichimoku.ichimoku_base_line()
+            current_price = df['Close'].iloc[-1]
+            if current_price > tenkan.iloc[-1] and tenkan.iloc[-1] > kijun.iloc[-1]:
+                return 1
+            elif current_price < tenkan.iloc[-1] and tenkan.iloc[-1] < kijun.iloc[-1]:
+                return -1
+            return 0
+        except Exception as e:
+            log_error("⛔ خطأ في حساب إشارة إيشيموكو: " + str(e))
+            return 0
+    def adx_signal(self, df: pd.DataFrame) -> int:
+        try:
+            adx_obj = ta.trend.ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
+            adx = adx_obj.adx()
+            adx_pos = adx_obj.adx_pos()
+            adx_neg = adx_obj.adx_neg()
+            current_adx = adx.iloc[-1]
+            if current_adx > 25:
+                if adx_pos.iloc[-1] > adx_neg.iloc[-1]:
+                    return 1
+                elif adx_pos.iloc[-1] < adx_neg.iloc[-1]:
+                    return -1
+            return 0
+        except Exception as e:
+            log_error("⛔ خطأ في حساب إشارة ADX: " + str(e))
+            return 0
+
+    def generate_signal_from_df(self, df: pd.DataFrame) -> str:
+        signals = {
+            'rsi': self.rsi_signal(df),
+            'macd': self.macd_signal(df),
+            'ema': self.ema_signal(df),
+            'ma_cross': self.ma_cross_signal(df),
+            'sr': self.support_resistance_signal(df),
+            'fib': self.fibonacci_signal(df),
+            'volume': self.volume_signal(df),
+            'bollinger': self.bollinger_signal(df),
+            'stoch': self.stoch_signal(df),
+            'momentum': self.momentum_signal(df),
+            'candlestick': self.candlestick_signal(df),
+            'ichimoku': self.ichimoku_signal(df),
+            'adx': self.adx_signal(df)
+        }
+        # حساب ميزات إضافية لتحسين التعديل باستخدام الذكاء الاصطناعي
+        volatility = df['Close'].rolling(14).std().iloc[-1] / df['Close'].mean()
+        avg_volume = df['Volume'].rolling(14).mean().iloc[-1]
+        # على سبيل المثال حساب تغير RSI بين آخر قيمتين
+        rsi_values = df['RSI']
+        rsi_change = rsi_values.iloc[-1] - rsi_values.iloc[-2] if len(rsi_values) >= 2 else 0
+        features = {
+            "volatility": volatility,
+            "avg_volume": avg_volume,
+            "rsi_change": rsi_change
+        }
+        # تعديل أوزان المؤشرات باستخدام الميزات
+        adjusted_weights = self.ml_model.adjust_signal_weights(STRATEGY_PARAMS['signal_weights'], features)
+        total_score = sum(adjusted_weights[k] * v for k, v in signals.items() if v != 0)
+        log_info("\n📊 تحليل الإشارات:")
+        for indicator, value in signals.items():
+            log_info(f"- {indicator.upper():<12} : {value:>3}")
+        log_info(f"🎯 النتيجة الإجمالية: {total_score:.2f}")
+        
+        # استخدام العتبة المعدلة بدقة أعلى باستخدام الميزات
+        dynamic_threshold = self.ml_model.adjust_threshold(STRATEGY_PARAMS['threshold'], features)
+        if total_score >= dynamic_threshold:
+            return 'up'
+        elif total_score <= -dynamic_threshold:
+            return 'down'
+        return 'none'
+    
+    def generate_signal_multi_tf(self, symbol: str) -> str:
+        df_15m = self.get_klines(symbol, '15m')
+        df_1h = self.get_klines(symbol, '1h')
+        df_4h = self.get_klines(symbol, '4h')
+        df_1m = self.get_klines(symbol, '1m')
+        df_5m = self.get_klines(symbol, '5m')
+        if df_15m.empty or df_1h.empty or df_4h.empty or len(df_15m) < 200 or len(df_1h) < 200 or len(df_4h) < 200:
+            return 'none'
+        signal_4h = self.generate_signal_from_df(df_4h)
+        signal_1h = self.generate_signal_from_df(df_1h)
+        signal_15m = self.generate_signal_from_df(df_15m)
+        signal_5m = self.generate_signal_from_df(df_5m)
+        signal_1m = self.generate_signal_from_df(df_1m)
+        log_info(f"📊 إشارة 4h: {signal_4h} | إشارة 1h: {signal_1h} | إشارة 15m: {signal_15m} | إشارة 5m: {signal_5m} | إشارة 1m: {signal_1m}")
+        if signal_4h == signal_1h == signal_15m == signal_5m == signal_1m and signal_15m != 'none':
+            return signal_15m
+        return 'none'
+    
+    def get_open_positions(self) -> list:
+        try:
+            positions = exchange.fetch_positions()
+            open_positions = [pos['symbol'] for pos in positions if float(pos.get('positionAmt', 0)) != 0]
+            log_info(f"🔓 المراكز المفتوحة: {', '.join(open_positions) or 'لا يوجد'}")
+            return open_positions
+        except Exception as error:
+            self.handle_api_error(error)
+            return []
+    
+    def get_symbol_precision(self, symbol: str):
+        try:
+            market = exchange.markets.get(symbol, {})
+            if market:
+                price_precision = market.get('precision', {}).get('price', None)
+                quantity_precision = market.get('precision', {}).get('amount', None)
+                if price_precision is not None:
+                    price_precision = int(price_precision)
+                if quantity_precision is not None:
+                    quantity_precision = int(quantity_precision)
+                return price_precision, quantity_precision
+            return None, None
+        except Exception as e:
+            log_error(f"⛔ فشل الحصول على دقة الرمز {symbol}: {str(e)}")
+            return None, None
+    
+    def calculate_position_size_dynamic(self, price: float, symbol: str) -> float:
+        df = self.get_klines(symbol)
+        if df.empty or price <= 0:
+            return 0.0
+        atr = df['ATR'].iloc[-1]
+        balance = self.get_balance_usdt()
+        risk_amount = balance * 0.01
+        position_size = (risk_amount / atr) * STRATEGY_PARAMS['leverage']
+        return round(position_size, 4)
+    
+    def update_trailing_stop(self, symbol: str, current_stop: float, signal: str, price_precision: int, quantity: float) -> None:
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            current_price = float(ticker['last'])
+            new_stop = (max(current_stop, current_price * (1 - STRATEGY_PARAMS['sl'] + 0.01))
+                        if signal == 'up'
+                        else min(current_stop, current_price * (1 + STRATEGY_PARAMS['sl'] - 0.01)))
+            new_stop = round(new_stop, price_precision)
+            if new_stop != current_stop:
+                log_info(f"🔄 تحديث وقف الخسارة لـ {symbol}: {new_stop}")
+        except Exception as error:
+            self.handle_api_error(error)
+    
+    def execute_trade(self, symbol: str, signal: str) -> None:
+        try:
+            log_info(f"\n⚡ محاولة تنفيذ صفقة {signal.upper()} على {symbol}")
+            ticker = exchange.fetch_ticker(symbol)
+            price = float(ticker['last'])
+            qty = self.calculate_position_size_dynamic(price, symbol)
+            features = {"volatility": 0.06}
+            weight_adjustment = self.ml_model.predict(features)
+            qty *= (1 + weight_adjustment)
+            price_precision, quantity_precision = self.get_symbol_precision(symbol)
+            if price_precision is None or quantity_precision is None:
+                log_error("⛔ لم يتمكن من تحديد دقة الرمز - تم التخطي")
+                return
+            price = round(price, price_precision)
+            qty = round(qty, quantity_precision)
+            notional = qty * price
+            if notional < 5:
+                qty = math.ceil((5 / price) * (10 ** quantity_precision)) / (10 ** quantity_precision)
+                log_info(f"📈 تعديل حجم الصفقة لتلبية الحد الأدنى للأمر: {qty:.{quantity_precision}f}")
+                notional = qty * price
+                if notional < 5:
+                    log_error("⛔ لا يمكن تلبية الحد الأدنى لقيمة الأمر - تم التخطي")
+                    return
+            if qty <= 0:
+                log_error("⛔ حجم صفقة غير صالح - تم التخطي")
+                return
+            side = 'buy' if signal == 'up' else 'sell'
+            log_info(f"📤 أمر دخول: {side.upper()} {qty:.{quantity_precision}f} {symbol} @ {price:.{price_precision}f}")
+            exchange.create_order(
+                symbol=symbol,
+                type='limit',
+                side=side,
+                amount=qty,
+                price=price,
+                params={'timeInForce': 'GTC'}
+            )
+            stop_price = price * (1 - STRATEGY_PARAMS['sl']) if side == 'buy' else price * (1 + STRATEGY_PARAMS['sl'])
+            take_profit = price * (1 + STRATEGY_PARAMS['tp']) if side == 'buy' else price * (1 - STRATEGY_PARAMS['tp'])
+            stop_price = round(stop_price, price_precision)
+            take_profit = round(take_profit, price_precision)
+            log_info(f"🛑 وقف الخسارة: {stop_price:.{price_precision}f}")
+            log_info(f"🎯 جني الأرباح: {take_profit:.{price_precision}f}")
+            exchange.create_order(
+                symbol=symbol,
+                type='stop_loss',
+                side='sell' if side == 'buy' else 'buy',
+                amount=qty,
+                price=stop_price
+            )
+            exchange.create_order(
+                symbol=symbol,
+                type='take_profit',
+                side='sell' if side == 'buy' else 'buy',
+                amount=qty,
+                price=take_profit
+            )
+        except Exception as error:
+            self.handle_api_error(error)
+    
+    def handle_api_error(self, error) -> None:
+        if isinstance(error, socket.gaierror):
+            log_error("🔌 خطأ في DNS - تعذر حل اسم الخادم")
+            log_info("1. غير إعدادات DNS إلى 8.8.8.8")
+            log_info("2. أعد تشغيل الراوتر")
+        elif isinstance(error, socket.timeout):
+            log_error("⏱ انتهت مهلة الاتصال")
+        else:
+            log_error(f"⚠️ خطأ غير متوقع: {type(error).__name__} - {str(error)}")
+        sleep(30)
+    
+    def run(self) -> None:
+        if not self.check_api_connectivity():
+            log_error("🛑 إيقاف التشغيل بسبب مشاكل اتصال")
+            return
+        monitor = Monitor(self)
+        monitor.start()
+        log_info("\n🚀 بدء دورة التداول...")
+        while True:
+            try:
+                self.risk_manager.reset_daily_loss()
+                balance = self.get_balance_usdt()
+                if balance <= 0:
+                    log_info("⏸ إيقاف مؤقت - الرصيد صفر")
+                    sleep(60)
+                    continue
+                symbols = self.get_tickers_usdt()
+                open_positions = self.get_open_positions()
+                for symbol in symbols:
+                    if len(open_positions) >= STRATEGY_PARAMS['max_positions']:
+                        log_info("⏹ الوصول للحد الأقصى للمراكز")
+                        break
+                    if symbol not in open_positions:
+                        signal = self.generate_signal_multi_tf(symbol)
+                        if signal != 'none':
+                            self.execute_trade(symbol, signal)
+                            open_positions.append(symbol)
+                            sleep(1)
+                log_info("\n⏳ انتظار الدورة القادمة (180 ثانية)...")
+                sleep(180)
+            except Exception as e:
+                log_error(f"⛔ خطأ حرج: {str(e)}")
+                self.handle_api_error(e)
+                sleep(300)
+
+if __name__ == "__main__":
+    bot = AdvancedTradingBot()
+    bot.run()
